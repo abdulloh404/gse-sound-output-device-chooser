@@ -39,25 +39,36 @@ class PAHelper():
         self._context = pa.pa_context_new( pa.pa_mainloop_get_api(self.mainloop), b'PAHelper')
         self._pa_context_notify_cb_t = pa.pa_context_notify_cb_t(self.pa_context_notify_cb_t)
         pa.pa_context_set_state_callback(self._context,   self._pa_context_notify_cb_t , None)
-        pa.pa_context_connect(self._context, None, 0, None)
         self._opn_completed = False
+        self._failed = False
+        if pa.pa_context_connect(self._context, None, 0, None) < 0:
+            self._failed = True
 
     def print_card_info(self, index = None):
         operation = None
         retVal = c_int()
-        counter = 0
+        clock = getattr(time, 'monotonic', time.time)
+        deadline = clock() + 2.5
 
-        while counter < 10000 and self._opn_completed == False:
-            counter += 1
+        while clock() < deadline and self._opn_completed == False and self._failed == False:
             if self._pa_state == pa.PA_CONTEXT_READY and operation == None:
                 self._pa_card_info_cb_t = pa.pa_card_info_cb_t(self.pa_card_info_cb)
 #                 operation = pa.pa_context_get_card_info_by_index(self._context,
 #                             index, self._pa_card_info_cb_t , None)
                 operation = pa.pa_context_get_card_info_list(self._context,
                              self._pa_card_info_cb_t , None)
+                if not operation:
+                    self._failed = True
+                    break
 
-            pa.pa_mainloop_iterate(self.mainloop, 0, byref(retVal))
-        print(dumps({'cards': self._cards, 'ports':self._ports}, indent = 5))
+            if pa.pa_mainloop_iterate(self.mainloop, 0, byref(retVal)) < 0:
+                self._failed = True
+            if not self._opn_completed and not self._failed:
+                time.sleep(0.005)
+
+        success = self._opn_completed and not self._failed
+        if success:
+            print(dumps({'cards': self._cards, 'ports':self._ports}, indent = 5))
         
         try:    
             if operation:
@@ -68,8 +79,14 @@ class PAHelper():
             pa.pa_mainloop_free(self.mainloop)
         except:
             pass
+        return 0 if success else 1
 
     def pa_card_info_cb(self, context, card_info, eol, whatever):
+        # eol ยืนยันว่า callback ส่ง card list ครบแล้ว จึงค่อยอนุญาตให้พิมพ์ snapshot
+        if eol:
+            self._failed = eol < 0
+            self._opn_completed = eol > 0
+            return
         
         if not card_info or not card_info[0]:
             return
@@ -125,17 +142,16 @@ class PAHelper():
         
         
         
-        self._opn_completed = True
-
-
     def pa_context_notify_cb_t(self, context, userdata):
         try:
             self._pa_state = pa.pa_context_get_state(context)
+            if self._pa_state in (pa.PA_CONTEXT_FAILED, pa.PA_CONTEXT_TERMINATED):
+                self._failed = True
             
         except Exception:
             self._pa_state = pa.PA_CONTEXT_FAILED
+            self._failed = True
         
 
-PAHelper().print_card_info()
+sys.exit(PAHelper().print_card_info())
             
-

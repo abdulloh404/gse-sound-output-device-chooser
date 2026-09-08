@@ -16,7 +16,7 @@
  ******************************************************************************/
 /* jshint moz:true */
 
-const { Gio, GLib, GObject } = imports.gi;
+const { Gio, GLib, GObject, Gvc } = imports.gi;
 const ExtensionUtils = imports.misc.extensionUtils;
 const Me = ExtensionUtils.getCurrentExtension();
 const Base = Me.imports.base;
@@ -149,9 +149,14 @@ var VolumeMenuInstance = class VolumeMenuInstance {
 
 var SDCInstance = class SDCInstance {
     constructor() {
+        this._cardSyncGeneration = 0;
+        this._cardSyncRetryId = null;
+        this._cardSyncAttempt = 0;
     }
 
     enable() {
+        this._enabled = true;
+        this._invalidateCardProfiles();
         this._settings = ExtensionUtils.getSettings();
         this._signalManager = new SignalManager();
         this._aggregateMenu = Main.panel.statusArea.aggregateMenu;
@@ -193,11 +198,86 @@ var SDCInstance = class SDCInstance {
         this._signalManager.addSignal(getActor(this._volumeMenu._input.item),
             "notify::visible", () => { this._updateMenuVisibility(this._inputInstance, false) });
 
-        this._enabled = true;
+        let control = this._outputInstance._getMixerControl();
+        this._signalManager.addSignal(control, "state-changed", this._onCardControlStateChanged.bind(this));
+        this._signalManager.addSignal(control, "card-added", this._queueCardProfileSync.bind(this));
+        this._signalManager.addSignal(control, "card-removed", this._queueCardProfileSync.bind(this));
+        this._signalManager.addSignal(this._settings, "changed::" + Prefs.NEW_PROFILE_ID, this._queueCardProfileSync.bind(this));
+        this._signalManager.addSignal(this._settings, "changed::" + Prefs.NEW_PROFILE_ID_DEPRECATED, this._queueCardProfileSync.bind(this));
+        this._onCardControlStateChanged(control);
+
         this._audioServerWatch = null;
         this._audioServerReconnectId = null;
         this._audioServerReconnectDelay = 250;
         this._startAudioServerWatch();
+    }
+
+    _invalidateCardProfiles() {
+        this._cardSyncGeneration++;
+        if (this._cardSyncRetryId) {
+            GLib.source_remove(this._cardSyncRetryId);
+            this._cardSyncRetryId = null;
+        }
+        this._cardSyncAttempt = 0;
+        Lib.invalidateCardCache();
+    }
+
+    _onCardControlStateChanged(control) {
+        if (!this._enabled) {
+            return;
+        }
+        if (control.get_state() == Gvc.MixerControlState.READY) {
+            this._queueCardProfileSync();
+        } else {
+            this._invalidateCardProfiles();
+        }
+    }
+
+    _queueCardProfileSync() {
+        if (!this._enabled || !this._outputInstance
+            || this._outputInstance._getMixerControl().get_state() != Gvc.MixerControlState.READY) {
+            return;
+        }
+        if (this._cardSyncRetryId) {
+            GLib.source_remove(this._cardSyncRetryId);
+            this._cardSyncRetryId = null;
+        }
+        this._cardSyncAttempt = 0;
+        this._cardSyncGeneration++;
+        this._refreshCardProfiles();
+    }
+
+    _refreshCardProfiles() {
+        if (!this._enabled || !this._outputInstance) {
+            return;
+        }
+        let control = this._outputInstance._getMixerControl();
+        if (control.get_state() != Gvc.MixerControlState.READY) {
+            return;
+        }
+        let generation = this._cardSyncGeneration;
+        Lib.refreshCardsAsync(successful => {
+            // คำตอบก่อน reconnect หรือ disable ต้องไม่กลับมาแก้เมนูของ session ใหม่
+            if (!this._enabled || generation != this._cardSyncGeneration
+                || control.get_state() != Gvc.MixerControlState.READY) {
+                return;
+            }
+            if (successful) {
+                this._cardSyncAttempt = 0;
+                this._outputInstance._refreshDeviceProfiles(control);
+                this._inputInstance._refreshDeviceProfiles(control);
+                return;
+            }
+            let delays = [250, 500, 1000, 2000];
+            if (this._cardSyncRetryId || this._cardSyncAttempt >= delays.length) {
+                return;
+            }
+            this._cardSyncRetryId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delays[this._cardSyncAttempt++], () => {
+                this._cardSyncRetryId = null;
+                this._refreshCardProfiles();
+                return GLib.SOURCE_REMOVE;
+            });
+        });
     }
 
     _syncAudioServerDefaults(facility, refreshDefault = true) {
@@ -289,6 +369,7 @@ var SDCInstance = class SDCInstance {
                     watcher.snapshotId = null;
                 }
                 this._syncAudioServerDefaults();
+                this._queueCardProfileSync();
             }
             // ไม่รับ client event จากคำสั่ง pactl ของเราเอง เพื่อไม่ให้เกิดวงจร sync ซ้ำ
             // sink/source change รีเฟรชข้อมูลใน GVC เท่านั้น จึงไม่เรียก pactl ขณะปรับ volume/mute
@@ -296,6 +377,9 @@ var SDCInstance = class SDCInstance {
             if (event) {
                 let refreshDefault = event[1] != "change" || event[2] == "server" || event[2] == "card";
                 this._syncAudioServerDefaults(event[2], refreshDefault);
+                if (event[2] == "card") {
+                    this._queueCardProfileSync();
+                }
             }
             this._readAudioServerEvent(watcher);
         });
@@ -306,6 +390,7 @@ var SDCInstance = class SDCInstance {
             return;
         }
         this._stopAudioServerWatch();
+        this._invalidateCardProfiles();
         this._queueAudioServerReconnect();
     }
 
@@ -428,25 +513,33 @@ var SDCInstance = class SDCInstance {
             this._audioServerReconnectId = null;
         }
         this._stopAudioServerWatch();
+        this._invalidateCardProfiles();
         //this._switchSubmenuMenu();
         this._revertVolMenuChanges();
         if (this._outputInstance) {
             this._outputInstance.setVisible(false);
-            this._outputInstance.destroy();
-            this._outputInstance = null;
+            this._updateMenuVisibility(this._outputInstance, false);
         }
         if (this._inputInstance) {
             this._inputInstance.setVisible(false);
-            this._inputInstance.destroy();
-            this._inputInstance = null;
+            this._updateMenuVisibility(this._inputInstance, false);
         }
+        // คืน slider ออกจาก chooser แล้วถอด signal ก่อนให้ GNOME เปลี่ยน visibility อีกครั้ง
+        this._signalManager.disconnectAll();
+        this._signalManager = null;
         if (this._volumeMenuInstance) {
             this._volumeMenuInstance.destroy();
             this._volumeMenuInstance = null;
         }
+        if (this._outputInstance) {
+            this._outputInstance.destroy();
+            this._outputInstance = null;
+        }
+        if (this._inputInstance) {
+            this._inputInstance.destroy();
+            this._inputInstance = null;
+        }
         this._settings = null;
-        this._signalManager.disconnectAll();
-        this._signalManager = null;
     }
 };
 

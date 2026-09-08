@@ -35,6 +35,356 @@ else {
 
 
 let cards;
+let ports;
+let _cardRefreshRequest = null;
+let _cardRefreshGeneration = 0;
+
+const CARD_REFRESH_TIMEOUT_MS = 3000;
+const INVALID_CARD_INDEX = 0xffffffff;
+
+function getCardCached(card_index) {
+    return cards ? cards[card_index] : undefined;
+}
+
+function getProfilesCached(control, uidevice) {
+    if (!control || !uidevice) {
+        return [];
+    }
+
+    let stream = null;
+    try {
+        stream = control.get_stream_from_device(uidevice);
+    }
+    catch (e) {
+        _log("Unable to look up stream for cached profile matching: " + e);
+    }
+
+    if (!stream) {
+        try {
+            stream = control.lookup_stream_id(uidevice.get_stream_id());
+        }
+        catch (e) {
+            _log("Unable to look up stream id for cached profile matching: " + e);
+        }
+    }
+
+    if (stream) {
+        let cardIndex;
+        try {
+            cardIndex = stream.get_card_index();
+        }
+        catch (e) {
+            cardIndex = stream.card_index;
+        }
+
+        // virtual source ไม่มี card จึงไม่มี profile ให้ค้นหา
+        if (cardIndex == null || cardIndex < 0 || cardIndex == INVALID_CARD_INDEX) {
+            return [];
+        }
+
+        let card = getCardCached(cardIndex);
+        return card ? (getProfilesForPort(uidevice.port_name, card) || []) : [];
+    }
+
+    let portName = uidevice.port_name;
+    if (!portName || !cards) {
+        return [];
+    }
+
+    let candidates = [];
+    Object.keys(cards).forEach(cardIndex => {
+        let card = cards[cardIndex];
+        if (!card || !Array.isArray(card.ports)) {
+            return;
+        }
+        card.ports.filter(port => port && port.name == portName)
+            .forEach(port => candidates.push({ cardIndex, card, port }));
+    });
+
+    let origin = uidevice.origin;
+    if (origin) {
+        let originMatches = candidates.filter(({ card, port }) => (
+            card.card_description == origin
+            || card.name == origin
+            || port.card_description == origin
+            || port.card_name == origin
+        ));
+        if (originMatches.length > 0) {
+            candidates = originMatches;
+        }
+    }
+
+    let description = uidevice.description;
+    if (description) {
+        let descriptionMatches = candidates.filter(({ port }) => port.human_name == description);
+        if (descriptionMatches.length > 0) {
+            candidates = descriptionMatches;
+        }
+    }
+
+    let uniqueCards = new Map();
+    candidates.forEach(candidate => uniqueCards.set(candidate.cardIndex, candidate));
+    if (uniqueCards.size != 1) {
+        return [];
+    }
+
+    let candidate = uniqueCards.values().next().value;
+    return getProfilesForPort(portName, candidate.card) || [];
+}
+
+function refreshCardsAsync(callback) {
+    let refreshCallback = (typeof callback == "function") ? callback : null;
+    if (_cardRefreshRequest) {
+        _cardRefreshRequest.dirty = true;
+        if (refreshCallback) {
+            _cardRefreshRequest.dirtyCallbacks.push(refreshCallback);
+        }
+        return;
+    }
+
+    _startCardRefresh(refreshCallback ? [refreshCallback] : []);
+}
+
+function cancelCardRefresh() {
+    _cardRefreshGeneration++;
+    let request = _cardRefreshRequest;
+    _cardRefreshRequest = null;
+    if (!request) {
+        return;
+    }
+
+    request.callbacks = [];
+    request.dirtyCallbacks = [];
+    request.dirty = false;
+    if (request.child) {
+        _cancelCardCommand(request.child);
+        request.child = null;
+    }
+}
+
+function invalidateCardCache() {
+    cancelCardRefresh();
+    cards = {};
+    ports = [];
+}
+
+function _startCardRefresh(callbacks) {
+    let request = {
+        generation: ++_cardRefreshGeneration,
+        callbacks,
+        dirty: false,
+        dirtyCallbacks: [],
+        child: null
+    };
+    _cardRefreshRequest = request;
+
+    let usePythonHelper = false;
+    try {
+        let settings = ExtensionUtils.getSettings();
+        usePythonHelper = settings.get_boolean(Prefs.NEW_PROFILE_ID_DEPRECATED)
+            && settings.get_boolean(Prefs.NEW_PROFILE_ID);
+    }
+    catch (e) {
+        _log("Unable to read profile parser setting: " + e);
+    }
+
+    let pythonExec = null;
+    if (usePythonHelper) {
+        pythonExec = ["python", "python3", "python2"]
+            .map(cmd => GLib.find_program_in_path(cmd))
+            .find(path => path != null);
+    }
+
+    if (pythonExec) {
+        let pyLocation = Me.dir.get_child("utils/pa_helper.py").get_path();
+        _runCardCommand(request, [pythonExec, pyLocation], (successful, out, errorMessage) => {
+            if (successful) {
+                try {
+                    let parsed = _parsePythonOutput(out);
+                    _commitCardData(parsed);
+                    _finishCardRefresh(request, true);
+                    return;
+                }
+                catch (e) {
+                    _log("Unable to parse Python card data. Falling back to pactl: " + e);
+                }
+            }
+            else {
+                _log("Python card refresh failed. Falling back to pactl: " + errorMessage);
+            }
+            _refreshCardsWithPactl(request);
+        });
+        return;
+    }
+
+    _refreshCardsWithPactl(request);
+}
+
+function _refreshCardsWithPactl(request) {
+    _runCardCommand(request, ["pactl", "list", "cards"], (successful, out, errorMessage) => {
+        if (!successful) {
+            _log("Async pactl card refresh failed: " + errorMessage);
+            _finishCardRefresh(request, false);
+            return;
+        }
+
+        try {
+            let parsed = _parsePactlOutput(out);
+            _commitCardData(parsed);
+            _finishCardRefresh(request, true);
+        }
+        catch (e) {
+            _log("Unable to parse pactl card data: " + e);
+            _finishCardRefresh(request, false);
+        }
+    });
+}
+
+function _runCardCommand(request, argv, callback) {
+    if (_cardRefreshRequest !== request || request.generation != _cardRefreshGeneration) {
+        return;
+    }
+
+    let operation = {
+        process: null,
+        cancellable: new Gio.Cancellable(),
+        timeoutId: null,
+        done: false
+    };
+
+    try {
+        let launcher = new Gio.SubprocessLauncher({
+            flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+        });
+        launcher.setenv("LANG", "C", true);
+        launcher.setenv("LC_ALL", "C", true);
+        operation.process = launcher.spawnv(argv);
+    }
+    catch (e) {
+        callback(false, "", e.message || e.toString());
+        return;
+    }
+
+    request.child = operation;
+    operation.timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, CARD_REFRESH_TIMEOUT_MS, () => {
+        operation.timeoutId = null;
+        if (operation.done) {
+            return GLib.SOURCE_REMOVE;
+        }
+
+        try {
+            operation.process.force_exit();
+        }
+        catch (e) {
+            _log("Unable to stop timed-out card refresh: " + e);
+        }
+        operation.cancellable.cancel();
+        _completeCardCommand(request, operation, callback, false, "", "Timed out");
+        return GLib.SOURCE_REMOVE;
+    });
+
+    operation.process.communicate_utf8_async(null, operation.cancellable, (process, result) => {
+        let successful = false;
+        let stdout = "";
+        let errorMessage = "";
+        try {
+            let [, out, err] = process.communicate_utf8_finish(result);
+            stdout = out || "";
+            errorMessage = (err || "").trim();
+            successful = process.get_successful();
+        }
+        catch (e) {
+            errorMessage = e.message || e.toString();
+        }
+        _completeCardCommand(request, operation, callback, successful, stdout, errorMessage);
+    });
+}
+
+function _completeCardCommand(request, operation, callback, successful, stdout, errorMessage) {
+    if (operation.done) {
+        return;
+    }
+    operation.done = true;
+    if (operation.timeoutId) {
+        GLib.source_remove(operation.timeoutId);
+        operation.timeoutId = null;
+    }
+    if (request.child === operation) {
+        request.child = null;
+    }
+    if (_cardRefreshRequest !== request || request.generation != _cardRefreshGeneration) {
+        return;
+    }
+    callback(successful, stdout, errorMessage);
+}
+
+function _cancelCardCommand(operation) {
+    if (operation.done) {
+        return;
+    }
+    operation.done = true;
+    if (operation.timeoutId) {
+        GLib.source_remove(operation.timeoutId);
+        operation.timeoutId = null;
+    }
+    operation.cancellable.cancel();
+    try {
+        operation.process.force_exit();
+    }
+    catch (e) {
+        _log("Unable to stop card refresh: " + e);
+    }
+}
+
+function _finishCardRefresh(request, successful) {
+    if (_cardRefreshRequest !== request || request.generation != _cardRefreshGeneration) {
+        return;
+    }
+
+    let callbacks = request.callbacks;
+    let dirty = request.dirty;
+    let dirtyCallbacks = request.dirtyCallbacks;
+    _cardRefreshRequest = null;
+
+    if (dirty) {
+        _startCardRefresh(dirtyCallbacks);
+    }
+
+    callbacks.forEach(callback => {
+        try {
+            callback(successful);
+        }
+        catch (e) {
+            _log("Card refresh callback failed: " + e);
+        }
+    });
+}
+
+function _commitCardData(data) {
+    cards = data.cards;
+    ports = data.ports;
+}
+
+function _parsePythonOutput(out) {
+    let parsed = JSON.parse(out);
+    if (!parsed || typeof parsed.cards != "object" || !Array.isArray(parsed.ports)) {
+        throw new Error("Invalid Python card data");
+    }
+
+    Object.values(parsed.cards).forEach(card => {
+        if (!Array.isArray(card.profiles)) {
+            card.profiles = [];
+        }
+        if (!Array.isArray(card.ports)) {
+            card.ports = [];
+        }
+        // pa_card_profile_info2.available เป็น boolean ส่วน availability ของ port เป็น enum คนละชนิด
+        card.profiles.forEach(profile => {
+            profile.available = (Number(profile.available) != 0) ? 1 : 0;
+        });
+    });
+    return parsed;
+}
 
 function getCard(card_index) {
     if (!cards || Object.keys(cards).length == 0) {
@@ -78,7 +428,6 @@ function getProfiles(control, uidevice) {
     return [];
 }
 
-let ports;
 function getPorts(refresh) {
     if (!ports || ports.length == 0 || refresh) {
         refreshCards();
@@ -169,6 +518,10 @@ function refreshCards() {
 }
 
 function parseOutput(out) {
+    _commitCardData(_parsePactlOutput(out));
+}
+
+function _parsePactlOutput(out) {
     let lines;
     if (out instanceof Uint8Array) {
         lines = ByteArray.toString(out).split("\n");
@@ -176,6 +529,8 @@ function parseOutput(out) {
         lines = out.toString().split("\n");
     }
 
+    let parsedCards = {};
+    let parsedPorts = [];
     let cardIndex;
     let parseSection = "CARDS";
     let port;
@@ -186,12 +541,12 @@ function parseOutput(out) {
 
         if ((matches = /^Card\s#(\d+)$/.exec(line))) {
             cardIndex = matches[1];
-            if (!cards[cardIndex]) {
-                cards[cardIndex] = { "index": cardIndex, "profiles": [], "ports": [] };
+            if (!parsedCards[cardIndex]) {
+                parsedCards[cardIndex] = { "index": cardIndex, "profiles": [], "ports": [] };
             }
         }
-        else if ((matches = /^\t*Name:\s+(.*?)$/.exec(line)) && cards[cardIndex]) {
-            cards[cardIndex].name = matches[1];
+        else if ((matches = /^\t*Name:\s+(.*?)$/.exec(line)) && parsedCards[cardIndex]) {
+            parsedCards[cardIndex].name = matches[1];
             parseSection = "CARDS"
         }
         else if (line.match(/^\tProperties:$/) && parseSection == "CARDS") {
@@ -203,24 +558,24 @@ function parseOutput(out) {
         else if (line.match(/^\t*Ports:$/)) {
             parseSection = "PORTS";
         }
-        else if (cards[cardIndex]) {
+        else if (parsedCards[cardIndex]) {
             switch (parseSection) {
                 case "PROPS":
                     if ((matches = /alsa\.card_name\s+=\s+"(.*?)"/.exec(line))) {
-                        cards[cardIndex].alsa_name = matches[1];
+                        parsedCards[cardIndex].alsa_name = matches[1];
                     }
                     else if ((matches = /device\.description\s+=\s+"(.*?)"/.exec(line))) {
-                        cards[cardIndex].card_description = matches[1];
+                        parsedCards[cardIndex].card_description = matches[1];
                     }
                     break;
                 case "PROFILES":
                     if ((matches = /.*?((?:output|input)[^+]*?):\s(.*?)\s\(sinks:.*?(?:available:\s*(.*?))*\)/.exec(line))) {
-                        let availability = matches[3] ? matches[3] : "yes" //If no availability in out, assume profile is available
+                        let availability = matches[3] ? matches[3] : "yes";
 
-                        cards[cardIndex].profiles.push({
+                        parsedCards[cardIndex].profiles.push({
                             "name": matches[1],
                             "human_name": matches[2],
-                            "available": (availability === "yes") ? 1 : 0
+                            "available": (availability === "no") ? 0 : 1
                         });
                     }
                     break;
@@ -229,11 +584,11 @@ function parseOutput(out) {
                         port = {
                             "name": matches[1],
                             "human_name": matches[2],
-                            "card_name": cards[cardIndex].name,
-                            "card_description": cards[cardIndex].card_description
+                            "card_name": parsedCards[cardIndex].name,
+                            "card_description": parsedCards[cardIndex].card_description
                         };
-                        cards[cardIndex].ports.push(port);
-                        ports.push(port);
+                        parsedCards[cardIndex].ports.push(port);
+                        parsedPorts.push(port);
                     }
                     else if (port && (matches = /\t*Part of profile\(s\):\s(.*)/.exec(line))) {
                         let profileStr = matches[1];
@@ -244,13 +599,14 @@ function parseOutput(out) {
             }
         }
     }
-    if (ports) {
-        ports.forEach(p => {
-            p.direction = p.profiles
+    if (parsedPorts) {
+        parsedPorts.forEach(p => {
+            p.direction = (p.profiles || [])
                 .filter(pr => pr.indexOf("+input:") == -1)
                 .some(pr => (pr.indexOf("output:") >= 0)) ? "Output" : "Input";
         });
     }
+    return { cards: parsedCards, ports: parsedPorts };
 }
 
 var Signal = class Signal {

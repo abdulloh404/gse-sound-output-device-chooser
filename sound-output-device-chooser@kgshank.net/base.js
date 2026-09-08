@@ -92,20 +92,9 @@ var SoundDeviceMenuItem = class SoundDeviceMenuItem extends PopupMenu.PopupImage
         this.id = id;
         this.title = title;
         this.icon_name = icon_name;
-        this.profiles = (profiles) ? profiles : [];
-
+        this.profiles = [];
         this.profilesitems = new Map();
-        for (let profile of this.profiles) {
-            let profileName = profile.name;
-            if (!this.profilesitems.has(profileName)) {
-                let pItem = new ProfileMenuItem(_("Profile: ") + profile.human_name, profileName);
-                this.profilesitems.set(profileName, pItem);
-                pItem.connect('activate', () => {
-                    _d("Activating Profile:" + id + profileName);
-                    this.emit("profile-activated", this.id, profileName);
-                });
-            }
-        }
+        this.setProfiles(profiles || []);
 
         this.connect('activate', () => {
             _d("Device Change request for " + id);
@@ -123,12 +112,34 @@ var SoundDeviceMenuItem = class SoundDeviceMenuItem extends PopupMenu.PopupImage
         return this.available;
     }
 
+    setProfiles(profiles) {
+        if (this.profiles.length == profiles.length && this.profiles.every((profile, index) =>
+            profile.name == profiles[index].name && profile.human_name == profiles[index].human_name)) {
+            return false;
+        }
+        this.profilesitems.forEach(item => item.destroy());
+        this.profilesitems.clear();
+        this.profiles = profiles;
+        for (let profile of profiles) {
+            if (this.profilesitems.has(profile.name)) {
+                continue;
+            }
+            let item = new ProfileMenuItem(_("Profile: ") + profile.human_name, profile.name);
+            item.setVisibility(false);
+            item.setProfileActive(profile.name == this.activeProfile);
+            item.connect('activate', () => this.emit("profile-activated", this.id, profile.name));
+            this.profilesitems.set(profile.name, item);
+        }
+        return true;
+    }
+
     setAvailable(_ac) {
         this.available = _ac;
     }
 
     setActiveProfile(_p) {
-        if (_p && this.activeProfile != _p) {
+        _p = _p || "";
+        if (this.activeProfile != _p) {
             if (this.profilesitems.has(this.activeProfile)) {
                 this.profilesitems.get(this.activeProfile).setProfileActive(false);
             }
@@ -214,6 +225,8 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
         this._defaultSyncPending = false;
         this._syncGeneration = 0;
         this._defaultQueryRunning = false;
+        this._defaultRetryId = null;
+        this._defaultRetryAttempt = 0;
         this._hasServerDefault = false;
         this._serverDefaultName = null;
         this._pendingSelection = null;
@@ -245,7 +258,14 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
             this._defaultSyncPending = false;
             this._hasServerDefault = false;
             this._serverDefaultName = null;
-            this._clearPendingSelection();
+            this._cancelDefaultRetry();
+            this._defaultRetryAttempt = 0;
+            if (this._pendingSelection) {
+                this._pendingSelection.preparedDevice = null;
+                this._pendingSelection.submittedStream = null;
+                this._pendingSelection.submittedName = null;
+                this._scheduleSelectionRetry(control);
+            }
             if (this._activeDeviceSyncId) {
                 GLib.source_remove(this._activeDeviceSyncId);
                 this._activeDeviceSyncId = null;
@@ -309,12 +329,39 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
     }
 
     _queueActiveDeviceSync(control) {
+        this._cancelDefaultRetry();
+        this._defaultRetryAttempt = 0;
+        this._queueDefaultQuery(control);
+    }
+
+    _queueDefaultQuery(control) {
         if (this._destroyed || control.get_state() != Gvc.MixerControlState.READY) {
             return;
         }
         this._syncGeneration++;
         this._defaultSyncPending = true;
         this._queueDeviceStateSync(control);
+    }
+
+    _cancelDefaultRetry() {
+        if (this._defaultRetryId) {
+            GLib.source_remove(this._defaultRetryId);
+            this._defaultRetryId = null;
+        }
+    }
+
+    _scheduleDefaultRetry(control) {
+        let delays = [250, 500, 1000, 2000];
+        if (this._destroyed || control.get_state() != Gvc.MixerControlState.READY
+            || this._defaultRetryId || this._defaultRetryAttempt >= delays.length) {
+            return;
+        }
+        // ลองอ่าน default ใหม่เฉพาะเมื่อคำสั่งล้มเหลว ไม่วนตรวจเมื่อระบบอยู่นิ่ง
+        this._defaultRetryId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delays[this._defaultRetryAttempt++], () => {
+            this._defaultRetryId = null;
+            this._queueDefaultQuery(control);
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     _queueDeviceStateSync(control) {
@@ -361,32 +408,35 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
                 return;
             }
             if (error) {
+                this._scheduleDefaultRetry(control);
                 // เก็บค่าที่ server ยืนยันล่าสุดเมื่อคำสั่งล้มเหลวชั่วคราว
                 if (this._hasServerDefault) {
                     return;
                 }
                 this._applyDefaultStream(control, this.getDefaultStream(control));
             } else {
+                this._cancelDefaultRetry();
+                this._defaultRetryAttempt = 0;
                 this._hasServerDefault = true;
                 this._serverDefaultName = name;
-                this._syncServerDefaultStream(control);
+                this._syncServerDefaultStream(control, true);
             }
         });
     }
 
-    _syncServerDefaultStream(control) {
+    _syncServerDefaultStream(control, confirmed = false) {
         let streams = this.deviceType == "output" ? control.get_sinks() : control.get_sources();
         let defaultStream = streams.find(stream => stream.get_name() == this._serverDefaultName);
-        this._applyDefaultStream(control, defaultStream, this._serverDefaultName);
+        this._applyDefaultStream(control, defaultStream, this._serverDefaultName, confirmed);
     }
 
-    _applyDefaultStream(control, defaultStream, name) {
+    _applyDefaultStream(control, defaultStream, name, confirmed = false) {
         this.emit("default-stream-resolved", defaultStream || null);
         let defaultDevice = defaultStream ? control.lookup_device_from_stream(defaultStream) : null;
         if (defaultDevice) {
             let selection = this._pendingSelection;
-            if (name && selection && selection.id == defaultDevice.get_id()
-                && selection.submittedName == name) {
+            if (confirmed && name && selection && selection.id == defaultDevice.get_id()
+                && selection.submittedName == name && selection.submittedStream === defaultStream) {
                 this._clearPendingSelection();
             }
             this._deviceActivated(control, defaultDevice.get_id());
@@ -523,7 +573,7 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
                 icon = this.getDefaultIcon();
             icon = this._getIcon(icon);
 
-            obj = new SoundDeviceMenuItem(id, title, icon, Lib.getProfiles(control, uidevice));
+            obj = new SoundDeviceMenuItem(id, title, icon, Lib.getProfilesCached(control, uidevice));
             obj.deviceKey = deviceKey;
             obj.connect("device-activated", (item, id) => this._changeDeviceBase(id));
             obj.connect("profile-activated", (item, id, name) => this._profileChangeCallback(id, name));
@@ -712,31 +762,23 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
             return;
         }
         let uidevice = this.lookupDeviceById(control, id);
-        if (this._isDeviceInValid(uidevice)) {
+        let item = this._devices.get(id);
+        if (this._isDeviceInValid(uidevice) && !(item && item.isVirtual && item.streamName)) {
             this._deviceRemoved(control, id);
             return;
         }
-        let item = this._devices.get(id);
-        if (item && item.isVirtual && !control.get_stream_from_device(uidevice)) {
-            let streams = this.deviceType == "output" ? control.get_sinks() : control.get_sources();
-            let stream = streams.find(candidate => candidate.get_name() == item.streamName);
-            uidevice = stream ? control.lookup_device_from_stream(stream) : null;
-            this._removeDevice(id);
-            if (!uidevice) {
-                this._queueActiveDeviceSync(control);
-                return;
-            }
-            id = uidevice.get_id();
-            this._deviceAdded(control, id);
-        }
+        let stream = uidevice ? control.get_stream_from_device(uidevice) : null;
         this._clearPendingSelection();
         this._pendingSelection = {
             id,
-            key: this._getDeviceKey(uidevice),
+            key: uidevice ? this._getDeviceKey(uidevice) : item.deviceKey,
+            streamName: stream ? stream.get_name() : (item ? item.streamName : null),
+            isVirtual: stream ? stream.get_card_index() == 0xffffffff : Boolean(item && item.isVirtual),
+            preparedDevice: null,
+            submittedStream: null,
             expires: GLib.get_monotonic_time() + 5000000,
             retryAt: 0,
         };
-        this.changeDevice(control, uidevice);
         this._completePendingSelection(control);
     }
 
@@ -750,14 +792,26 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
 
     _completePendingSelection(control) {
         let selection = this._pendingSelection;
-        if (!selection || this._selectionRunning) {
+        if (!selection || this._destroyed) {
             return;
         }
-        let uidevice = this.lookupDeviceById(control, selection.id);
-        if (!uidevice || this._getDeviceKey(uidevice) != selection.key
-            || GLib.get_monotonic_time() >= selection.expires) {
+        if (GLib.get_monotonic_time() >= selection.expires) {
             this._clearPendingSelection();
+            this._queueActiveDeviceSync(control);
             return;
+        }
+        this._scheduleSelectionRetry(control);
+        if (control.get_state() != Gvc.MixerControlState.READY || this._selectionRunning) {
+            return;
+        }
+        let uidevice = this._resolveSelectionDevice(control, selection);
+        if (!uidevice) {
+            return;
+        }
+        selection.id = uidevice.get_id();
+        if (selection.preparedDevice !== uidevice) {
+            selection.preparedDevice = uidevice;
+            this.changeDevice(control, uidevice);
         }
         let stream = control.get_stream_from_device(uidevice);
         if (!stream || GLib.get_monotonic_time() < selection.retryAt) {
@@ -768,7 +822,8 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
             return;
         }
         let name = stream.get_name();
-        if (selection.submittedName == name) {
+        selection.streamName = name;
+        if (selection.submittedStream === stream) {
             return;
         }
         let streamType = this.deviceType == "output" ? "sink" : "source";
@@ -780,17 +835,75 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
             if (this._pendingSelection === selection) {
                 if (!error) {
                     selection.submittedName = name;
-                } else if (!this._selectionRetryId) {
-                    // ลองซ้ำเฉพาะคำสั่งเลือกอุปกรณ์ที่ล้มเหลว และยังใช้เวลาหมดอายุเดิม
-                    this._selectionRetryId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
-                        this._selectionRetryId = null;
-                        this._queueActiveDeviceSync(control);
-                        return GLib.SOURCE_REMOVE;
-                    });
+                    selection.submittedStream = stream;
                 }
             }
             this._queueActiveDeviceSync(control);
         });
+    }
+
+    _scheduleSelectionRetry(control) {
+        let selection = this._pendingSelection;
+        if (!selection || this._destroyed || this._selectionRetryId) {
+            return;
+        }
+        let remaining = Math.ceil((selection.expires - GLib.get_monotonic_time()) / 1000);
+        this._selectionRetryId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, Math.max(1, Math.min(250, remaining)), () => {
+            this._selectionRetryId = null;
+            if (this._pendingSelection === selection) {
+                this._completePendingSelection(control);
+            }
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _resolveSelectionDevice(control, selection) {
+        if (selection.isVirtual) {
+            // virtual mic อาจกลับมาด้วย ID ใหม่ จึงตามชื่อ node ภายในเวลาของคำขอเดิม
+            let streams = this.deviceType == "output" ? control.get_sinks() : control.get_sources();
+            let stream = streams.find(candidate => candidate.get_name() == selection.streamName
+                && candidate.get_card_index() == 0xffffffff);
+            let device = stream ? control.lookup_device_from_stream(stream) : null;
+            if (device) {
+                selection.key = this._getDeviceKey(device);
+                if (!this._devices.has(device.get_id())) {
+                    this._deviceAdded(control, device.get_id());
+                }
+            }
+            return device;
+        }
+        let device = this.lookupDeviceById(control, selection.id);
+        if (device && this._getDeviceKey(device) == selection.key
+            && control.get_stream_from_device(device)) {
+            return device;
+        }
+        let matches = Array.from(this._devices.keys()).map(id => this.lookupDeviceById(control, id))
+            .filter(candidate => candidate && this._getDeviceKey(candidate) == selection.key);
+        return matches.length == 1 ? matches[0] : null;
+    }
+
+    _refreshDeviceProfiles(control) {
+        if (this._destroyed || control.get_state() != Gvc.MixerControlState.READY) {
+            return;
+        }
+        this._devices.forEach((device, id) => {
+            let uidevice = this.lookupDeviceById(control, id);
+            if (!uidevice) {
+                return;
+            }
+            if (device.isVirtual && !control.get_stream_from_device(uidevice)) {
+                this._removeDevice(id);
+                return;
+            }
+            if (device.setProfiles(Lib.getProfilesCached(control, uidevice))) {
+                let position = this.menuItem.menu._getMenuItems().indexOf(device) + 1;
+                device.profilesitems.forEach(item => this.menuItem.menu.addMenuItem(item, position++));
+            }
+        });
+        this._resetDevices();
+        this._setChooserVisibility();
+        this._setVisibility();
+        this._queueDeviceStateSync(control);
     }
 
     _setActiveProfile() {
@@ -863,7 +976,7 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
 
     _setProfileVisibility() {
         let visibility = this._settings.get_boolean(Prefs.SHOW_PROFILES);
-        this._getAvailableDevices().forEach(device => device.setProfileVisibility(visibility));
+        this._devices.forEach(device => device.setProfileVisibility(visibility && device.isAvailable()));
     }
 
     _getIcon(name) {
@@ -914,7 +1027,7 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
                 let cardId = stream.get_card_index();
                 if (cardId != null) {
                     _d("Card Index:" + cardId);
-                    let _card = Lib.getCard(cardId);
+                    let _card = Lib.getCardCached(cardId);
                     if (_card) {
                         cardName = _card.name;
                     }
@@ -1016,6 +1129,7 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
 
     destroy() {
         this._destroyed = true;
+        this._cancelDefaultRetry();
         this._clearPendingSelection();
         this._pactlRequests.forEach(request => {
             if (request.timeoutId) {
