@@ -222,21 +222,24 @@ var SDCInstance = class SDCInstance {
         let canIntegrate = sliderItem.visible && (visible || selectorItem.visible) && this._settings.get_boolean(Prefs.INTEGRATE_WITH_SLIDER);
         if (canIntegrate == true) {
             _d("Integrating with Volume menu ");
-            if (_volumeMenu.box.contains(sliderItem) == true) {
-                _volumeMenu.box.remove_child(sliderItem);
+            if (sliderItem.get_parent() != selectorItem) {
+                let parent = sliderItem.get_parent();
+                if (parent) {
+                    parent.remove_child(sliderItem);
+                }
+                selectorItem.insert_child_above(sliderItem, selectorItem.label);
             }
             sliderItem.set_x_expand(true);
             sliderItem.set_style('padding-right: 0px;');
             sliderItem._ornamentLabel.hide();
             sliderItem.set_track_hover(false);
-            selectorItem.insert_child_above(sliderItem, selectorItem.label);
             selectorItem.label.hide();
             sliderItem.get_next_sibling().hide(); //expander
             selectorItem.icon.hide();
             selectorItem.set_style('padding-left: 0px;padding-top: 0px; padding-bottom: 0px');
         } else {
             _d("Not integrating with Volume menu")
-            if (selectorItem.contains(sliderItem) == true) {
+            if (sliderItem.get_parent() == selectorItem) {
                 selectorItem.remove_child(sliderItem);
             }
             sliderItem.set_x_expand(false);
@@ -247,7 +250,11 @@ var SDCInstance = class SDCInstance {
             selectorItem.label.get_next_sibling().show(); //expander
             selectorItem.icon.show();
             selectorItem.set_style('');
-            if (_volumeMenu.box.contains(sliderItem) == false) {
+            if (sliderItem.get_parent() != _volumeMenu.box) {
+                let parent = sliderItem.get_parent();
+                if (parent) {
+                    parent.remove_child(sliderItem);
+                }
                 let oriVisible = sliderItem.visible;
                 _volumeMenu.box.insert_child_below(sliderItem, selectorItem);
                 sliderItem.visible = oriVisible;

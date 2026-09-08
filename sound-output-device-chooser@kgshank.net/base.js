@@ -16,7 +16,7 @@
  ******************************************************************************/
 /* jshint moz:true */
 
-const { GObject, GLib, Gvc } = imports.gi;
+const { Gio, GObject, GLib, Gvc } = imports.gi;
 
 const Signals = imports.signals;
 
@@ -209,6 +209,15 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
         this.menuItem = new PopupMenu.PopupSubMenuMenuItem(_("Extension initialising..."), true);
         this.deviceType = deviceType;
         this._devices = new Map();
+        this._activeDeviceId = null;
+        this._activeDeviceSyncId = null;
+        this._syncGeneration = 0;
+        this._defaultQueryRunning = false;
+        this._hasServerDefault = false;
+        this._pendingSelection = null;
+        this._selectionRunning = false;
+        this._pactlRequests = new Set();
+        this._destroyed = false;
         let _control = this._getMixerControl();
         this._settings = ExtensionUtils.getSettings();
         _d("Constructor:" + deviceType);
@@ -222,6 +231,11 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
 
         this._signalManager.addSignal(this.menuItem.menu, "open-state-changed", this._onSubmenuOpenStateChanged.bind(this));
         this._signalManager.addSignal(this.menuItem, "notify::visible", () => {this.emit('update-visibility', getActor(this.menuItem).visible);});
+        // ตรวจ default จาก server ซ้ำเพื่อฟื้นตัวเมื่อ GVC ของ Shell พลาด event หลัง reconnect
+        this._defaultRefreshId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 2, () => {
+            this._queueActiveDeviceSync(_control);
+            return GLib.SOURCE_CONTINUE;
+        });
     }
 
     _getMixerControl() { return VolumeMenu.getMixerControl(); }
@@ -230,6 +244,12 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
 
     _onControlStateChanged(control) {
         if (control.get_state() != Gvc.MixerControlState.READY) {
+            this._syncGeneration++;
+            this._pendingSelection = null;
+            if (this._activeDeviceSyncId) {
+                GLib.source_remove(this._activeDeviceSyncId);
+                this._activeDeviceSyncId = null;
+            }
             this.menuItem.menu.removeAll();
             this._devices.clear();
             this._activeDeviceId = null;
@@ -241,9 +261,11 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
             if (!this._controlSignalsConnected) {
                 this._signalManager.addSignal(control, this.deviceType + "-added", this._deviceAdded.bind(this));
                 this._signalManager.addSignal(control, this.deviceType + "-removed", this._deviceRemoved.bind(this));
-                this._signalManager.addSignal(control, "active-" + this.deviceType + "-update", this._deviceActivated.bind(this));
+                this._signalManager.addSignal(control, "active-" + this.deviceType + "-update", this._queueActiveDeviceSync.bind(this));
                 let defaultStreamType = this.deviceType == "output" ? "sink" : "source";
-                this._signalManager.addSignal(control, "default-" + defaultStreamType + "-changed", this._syncActiveDevice.bind(this));
+                this._signalManager.addSignal(control, "default-" + defaultStreamType + "-changed", this._queueActiveDeviceSync.bind(this));
+                this._signalManager.addSignal(control, "stream-added", this._queueActiveDeviceSync.bind(this));
+                this._signalManager.addSignal(control, "stream-removed", this._queueActiveDeviceSync.bind(this));
 
                 this._signalManager.addSignal(this._settings, "changed::" + Prefs.HIDE_ON_SINGLE_DEVICE, this._setChooserVisibility.bind(this));
                 this._signalManager.addSignal(this._settings, "changed::" + Prefs.SHOW_PROFILES, this._setProfileVisibility.bind(this));
@@ -278,7 +300,7 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
             while (++id < maxId) {
                 this._deviceAdded(control, id);
             }
-            this._syncActiveDevice(control);
+            this._queueActiveDeviceSync(control);
 
             this._setVisibility();
         }
@@ -288,31 +310,144 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
         _d(this.deviceType + "-Submenu is now open?: " + opened);
         if (opened) {   // Actions when submenu is opening
             this._setActiveProfile();
+            this._queueActiveDeviceSync(this._getMixerControl());
         }
         else {          // Actions when submenu is closing
         }
     }
 
-    _syncActiveDevice(control) {
-        let defaultStream = this.getDefaultStream(control);
-        if (!defaultStream) {
+    _queueActiveDeviceSync(control) {
+        if (this._destroyed || control.get_state() != Gvc.MixerControlState.READY) {
+            return;
+        }
+        this._syncGeneration++;
+        if (this._activeDeviceSyncId) {
             return;
         }
 
-        let activePort = defaultStream.get_port();
-        let defaultDevice = Array.from(this._devices.keys())
-            .map(id => this.lookupDeviceById(control, id))
-            .find(uidevice => {
-                if (!uidevice) {
-                    return false;
-                }
+        this._activeDeviceSyncId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            this._activeDeviceSyncId = null;
+            if (control.get_state() == Gvc.MixerControlState.READY) {
+                this._completePendingSelection(control);
+                this._syncActiveDevice(control);
+            }
+            return false;
+        });
+    }
 
-                let stream = control.get_stream_from_device(uidevice);
-                return stream && stream.get_id() == defaultStream.get_id()
-                    && (!activePort || uidevice.port_name == activePort.port);
-            });
-        if (defaultDevice && this._devices.has(defaultDevice.get_id())) {
-            this._deviceActivated(control, defaultDevice.get_id());
+    _syncActiveDevice(control) {
+        if (this._defaultQueryRunning) {
+            return;
+        }
+        this._defaultQueryRunning = true;
+        let generation = this._syncGeneration;
+        let streamType = this.deviceType == "output" ? "sink" : "source";
+
+        // GVC อาจยังเก็บ default เดิมหลังส่งคำสั่ง จึงอ่านชื่อจริงผ่าน PipeWire-Pulse
+        this._runPactl(["get-default-" + streamType], (name, error) => {
+            this._defaultQueryRunning = false;
+            if (control.get_state() != Gvc.MixerControlState.READY) {
+                return;
+            }
+            if (generation != this._syncGeneration) {
+                this._queueActiveDeviceSync(control);
+                return;
+            }
+            let defaultStream;
+            if (error) {
+                // เก็บค่าที่ server ยืนยันล่าสุดเมื่อคำสั่งล้มเหลวชั่วคราว
+                if (this._hasServerDefault) {
+                    return;
+                }
+                defaultStream = this.getDefaultStream(control);
+            } else {
+                this._hasServerDefault = true;
+                let streams = this.deviceType == "output" ? control.get_sinks() : control.get_sources();
+                defaultStream = streams.find(stream => stream.get_name() == name);
+            }
+            let defaultDevice = defaultStream ? control.lookup_device_from_stream(defaultStream) : null;
+            if (defaultDevice) {
+                let selection = this._pendingSelection;
+                if (!error && selection && selection.id == defaultDevice.get_id()
+                    && selection.submittedName == name) {
+                    this._pendingSelection = null;
+                }
+                this._deviceActivated(control, defaultDevice.get_id());
+                if (this._devices.has(defaultDevice.get_id())) {
+                    return;
+                }
+            }
+            this._clearActiveDevice(defaultStream);
+            if (!defaultStream && name) {
+                this.menuItem.label.text = name;
+            }
+        });
+    }
+
+    _runPactl(args, callback) {
+        let process;
+        try {
+            process = Gio.Subprocess.new(["pactl", ...args],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+        } catch (error) {
+            _d("Audio server command failed: " + error.message);
+            callback(null, error.message);
+            return;
+        }
+        let request = { process, cancellable: new Gio.Cancellable(), timeoutId: null };
+        this._pactlRequests.add(request);
+        request.timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 3000, () => {
+            request.timeoutId = null;
+            process.force_exit();
+            request.cancellable.cancel();
+            return GLib.SOURCE_REMOVE;
+        });
+        process.communicate_utf8_async(null, request.cancellable, (source, result) => {
+            if (request.timeoutId) {
+                GLib.source_remove(request.timeoutId);
+            }
+            this._pactlRequests.delete(request);
+            let output = null;
+            let failure = null;
+            try {
+                let [ok, stdout, stderr] = source.communicate_utf8_finish(result);
+                if (ok && source.get_successful()) {
+                    output = (stdout || "").trim();
+                } else {
+                    failure = (stderr || "").trim() || "Audio server command failed";
+                }
+            } catch (error) {
+                failure = error.message;
+            }
+            if (!this._destroyed) {
+                if (failure) {
+                    _d("Audio server command failed: " + failure);
+                }
+                callback(output, failure);
+            }
+        });
+    }
+
+    _clearActiveDevice(defaultStream) {
+        let activeDevice = this._devices.get(this._activeDeviceId);
+        if (activeDevice) {
+            activeDevice.setActiveDevice(false);
+        }
+        this._activeDeviceId = null;
+
+        if (defaultStream) {
+            this.menuItem.label.text = defaultStream.get_description() || defaultStream.get_name();
+            if (!this._settings.get_boolean(Prefs.HIDE_MENU_ICONS)) {
+                let icon = defaultStream.get_icon_name() || this.getDefaultIcon();
+                this.menuItem.icon.icon_name = this._getIcon(icon);
+            }
+        }
+        else {
+            this.menuItem.label.text = _("Extension initialising...");
+        }
+
+        if (this._settings.get_boolean(Prefs.HIDE_MENU_ICONS)) {
+            this.menuItem.icon.gicon = null;
         }
     }
 
@@ -334,6 +469,9 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
     }
 
     _deviceAdded(control, id, dontcheck) {
+        if (control.get_state() != Gvc.MixerControlState.READY) {
+            return;
+        }
         let obj = this._devices.get(id);
         let uidevice = this.lookupDeviceById(control, id);
 
@@ -349,6 +487,7 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
             obj = null;
         }
 
+        let wasAvailable = obj && obj.isAvailable();
         if (!obj) {
             let stream = control.get_stream_from_device(uidevice);
             let duplicateIds = Array.from(this._devices.entries())
@@ -380,15 +519,22 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
         }
         else if (!obj.isAvailable())
             obj.setAvailable(true);
-        else
+
+        let stream = control.get_stream_from_device(uidevice);
+        if (stream) {
+            obj.streamName = stream.get_name();
+            obj.isVirtual = stream.get_card_index() == 0xffffffff;
+        }
+        if (wasAvailable) {
+            this._queueActiveDeviceSync(control);
             return;
+        }
 
 
         _d("Device Name:" + obj.title);
 
         _d("Added: " + id + ":" + uidevice.description + ":" + uidevice.port_name + ":" + uidevice.origin);
 
-        let stream = control.get_stream_from_device(uidevice);
         if (stream) {
             obj.setActiveProfile(uidevice.get_active_profile());
         }
@@ -401,6 +547,7 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
             this._setChooserVisibility();
             this._setVisibility();
         }
+        this._queueActiveDeviceSync(control);
     }
 
     _profileChangeCallback(id, profileName) {
@@ -422,6 +569,13 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
 
     _deviceRemoved(control, id, dontcheck) {
         let obj = this._devices.get(id);
+        if (!dontcheck && obj && obj.isVirtual) {
+            this._removeDevice(id);
+            this._setChooserVisibility();
+            this._setVisibility();
+            this._queueActiveDeviceSync(control);
+            return;
+        }
 
         if (obj && obj.isAvailable()) {
             _d("Removed: " + id + ":" + obj.title);
@@ -462,6 +616,7 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
             this._setChooserVisibility();
             this._setVisibility();
         }
+        this._queueActiveDeviceSync(control);
     }
 
     _deviceActivated(control, id) {
@@ -537,24 +692,71 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
         if (!control) {
             control = this._getMixerControl();
         }
+        if (control.get_state() != Gvc.MixerControlState.READY) {
+            return;
+        }
         let uidevice = this.lookupDeviceById(control, id);
-        if (uidevice) {
-            let stream = control.get_stream_from_device(uidevice);
-            if (stream) {
-                this.changeDevice(control, uidevice);
+        if (this._isDeviceInValid(uidevice)) {
+            this._deviceRemoved(control, id);
+            return;
+        }
+        let item = this._devices.get(id);
+        if (item && item.isVirtual && !control.get_stream_from_device(uidevice)) {
+            let streams = this.deviceType == "output" ? control.get_sinks() : control.get_sources();
+            let stream = streams.find(candidate => candidate.get_name() == item.streamName);
+            uidevice = stream ? control.lookup_device_from_stream(stream) : null;
+            this._removeDevice(id);
+            if (!uidevice) {
+                this._queueActiveDeviceSync(control);
                 return;
             }
-            let obj = this._devices.get(id);
-            let profiles = obj && obj.profiles.length > 0
-                ? obj.profiles
-                : Lib.getProfiles(control, uidevice);
-            if (profiles.length > 0) {
-                control.change_profile_on_selected_device(uidevice, profiles[0].name);
+            id = uidevice.get_id();
+            this._deviceAdded(control, id);
+        }
+        this._pendingSelection = {
+            id,
+            key: this._getDeviceKey(uidevice),
+            expires: GLib.get_monotonic_time() + 5000000,
+            retryAt: 0,
+        };
+        this.changeDevice(control, uidevice);
+        this._completePendingSelection(control);
+    }
+
+    _completePendingSelection(control) {
+        let selection = this._pendingSelection;
+        if (!selection || this._selectionRunning) {
+            return;
+        }
+        let uidevice = this.lookupDeviceById(control, selection.id);
+        if (!uidevice || this._getDeviceKey(uidevice) != selection.key
+            || GLib.get_monotonic_time() >= selection.expires) {
+            this._pendingSelection = null;
+            return;
+        }
+        let stream = control.get_stream_from_device(uidevice);
+        if (!stream || GLib.get_monotonic_time() < selection.retryAt) {
+            return;
+        }
+        let activeDevice = control.lookup_device_from_stream(stream);
+        if (!activeDevice || activeDevice.get_id() != selection.id) {
+            return;
+        }
+        let name = stream.get_name();
+        if (selection.submittedName == name) {
+            return;
+        }
+        let streamType = this.deviceType == "output" ? "sink" : "source";
+        this._selectionRunning = true;
+        // รอ GVC เตรียม profile/port แล้วส่ง default ด้วยชื่อ stream ที่ยังมีอยู่จริง
+        this._runPactl(["set-default-" + streamType, name], (_output, error) => {
+            this._selectionRunning = false;
+            selection.retryAt = GLib.get_monotonic_time() + 250000;
+            if (!error && this._pendingSelection === selection) {
+                selection.submittedName = name;
             }
-        }
-        else {
-            this._deviceRemoved(control, id);
-        }
+            this._queueActiveDeviceSync(control);
+        });
     }
 
     _setActiveProfile() {
@@ -660,7 +862,10 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
         // These indicate the active device, which is displayed directly in the
         // Gnome menu, not in the list.
         if (!this._settings.get_boolean(Prefs.HIDE_MENU_ICONS)) {
-            this.menuItem.icon.icon_name = this._getIcon(this._devices.get(this._activeDeviceId).icon_name);
+            let activeDevice = this._devices.get(this._activeDeviceId);
+            if (activeDevice) {
+                this.menuItem.icon.icon_name = this._getIcon(activeDevice.icon_name);
+            }
         } else {
             this.menuItem.icon.icon_name = null;
         }
@@ -753,13 +958,18 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
         let control = this._getMixerControl();
         this._devices.forEach((device, id) => {
             let uidevice = this.lookupDeviceById(control, id);
-            let title = this._getDeviceTitle(uidevice);
+            if (!uidevice) {
+                return;
+            }
 
+            let title = this._getDeviceTitle(uidevice);
             device.setTitle(title);
         });
 
         let activeDevice = this._devices.get(this._activeDeviceId);
-        this.menuItem.label.text = activeDevice.title;
+        if (activeDevice) {
+            this.menuItem.label.text = activeDevice.title;
+        }
     }
 
     _getDeviceTitle(uidevice) {
@@ -771,6 +981,20 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
     }
 
     destroy() {
+        this._destroyed = true;
+        this._pendingSelection = null;
+        if (this._defaultRefreshId) {
+            GLib.source_remove(this._defaultRefreshId);
+            this._defaultRefreshId = null;
+        }
+        this._pactlRequests.forEach(request => {
+            if (request.timeoutId) {
+                GLib.source_remove(request.timeoutId);
+                request.timeoutId = null;
+            }
+            request.process.force_exit();
+            request.cancellable.cancel();
+        });
         this._signalManager.disconnectAll();
         if (this.deviceRemovedTimout) {
             GLib.source_remove(this.deviceRemovedTimout);
@@ -779,6 +1003,10 @@ var SoundDeviceChooserBase = class SoundDeviceChooserBase {
         if (this.activeProfileTimeout) {
             GLib.source_remove(this.activeProfileTimeout);
             this.activeProfileTimeout = null;
+        }
+        if (this._activeDeviceSyncId) {
+            GLib.source_remove(this._activeDeviceSyncId);
+            this._activeDeviceSyncId = null;
         }
         this.menuItem.destroy();
     }
