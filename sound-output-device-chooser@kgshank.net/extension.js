@@ -68,7 +68,7 @@ var SoundInputDeviceChooser = class SoundInputDeviceChooser
 };
 
 var VolumeMenuInstance = class VolumeMenuInstance {
-    constructor(volumeMenu, settings) {
+    constructor(volumeMenu, settings, outputChooser, inputChooser) {
         this._settings = settings;
 
         this._volumeMenu = volumeMenu;
@@ -80,6 +80,17 @@ var VolumeMenuInstance = class VolumeMenuInstance {
         this._signalManager = new SignalManager();
         this._signalManager.addSignal(this._settings, "changed::"
             + Prefs.SHOW_INPUT_SLIDER, this._setSliderVisiblity.bind(this));
+        // stream setter ของ GNOME ติดตาม volume/mute และอัปเดต slider โดยไม่เขียนเสียงกลับ
+        this._signalManager.addSignal(outputChooser, "default-stream-resolved", (_chooser, stream) => {
+            if (this._volumeMenu._output.stream !== stream) {
+                this._volumeMenu._output.stream = stream;
+            }
+        });
+        this._signalManager.addSignal(inputChooser, "default-stream-resolved", (_chooser, stream) => {
+            if (this._input.stream !== stream) {
+                this._input.stream = stream;
+            }
+        });
     }
     _overrideFunctions() {
         // Fix the indicator when using SHOW_INPUT_SLIDER. 
@@ -131,6 +142,8 @@ var VolumeMenuInstance = class VolumeMenuInstance {
         delete this._input['_shouldBeVisibleOriginal'];
         delete this._input['_shouldBeVisibleCustom'];
         delete this._input['_showInputSlider'];               // variable
+        this._volumeMenu._readOutput();
+        this._volumeMenu._readInput();
     }
 }
 
@@ -161,7 +174,8 @@ var SDCInstance = class SDCInstance {
         }
 
         if (this._volumeMenuInstance == null) {
-            this._volumeMenuInstance = new VolumeMenuInstance(this._volumeMenu, this._settings);
+            this._volumeMenuInstance = new VolumeMenuInstance(this._volumeMenu, this._settings,
+                this._outputInstance, this._inputInstance);
         }
 
         this._addMenuItem(this._volumeMenu, this._volumeMenu._output.item, this._outputInstance.menuItem);
@@ -186,16 +200,23 @@ var SDCInstance = class SDCInstance {
         this._startAudioServerWatch();
     }
 
-    _syncAudioServerDefaults(facility) {
+    _syncAudioServerDefaults(facility, refreshDefault = true) {
         if (!this._enabled) {
             return;
         }
         let control = this._outputInstance._getMixerControl();
+        let sync = chooser => {
+            if (refreshDefault) {
+                chooser._queueActiveDeviceSync(control);
+            } else {
+                chooser._queueDeviceStateSync(control);
+            }
+        };
         if (facility != "source") {
-            this._outputInstance._queueActiveDeviceSync(control);
+            sync(this._outputInstance);
         }
         if (facility != "sink") {
-            this._inputInstance._queueActiveDeviceSync(control);
+            sync(this._inputInstance);
         }
     }
 
@@ -270,10 +291,11 @@ var SDCInstance = class SDCInstance {
                 this._syncAudioServerDefaults();
             }
             // ไม่รับ client event จากคำสั่ง pactl ของเราเอง เพื่อไม่ให้เกิดวงจร sync ซ้ำ
-            // ข้าม sink/source change จาก volume/mute; การเปลี่ยน port มี GVC active-update รองรับ
+            // sink/source change รีเฟรชข้อมูลใน GVC เท่านั้น จึงไม่เรียก pactl ขณะปรับ volume/mute
             let event = /^Event '(new|change|remove)' on (server|sink|source|card) #\d+$/.exec(line);
-            if (event && (event[1] != "change" || event[2] == "server" || event[2] == "card")) {
-                this._syncAudioServerDefaults(event[2]);
+            if (event) {
+                let refreshDefault = event[1] != "change" || event[2] == "server" || event[2] == "card";
+                this._syncAudioServerDefaults(event[2], refreshDefault);
             }
             this._readAudioServerEvent(watcher);
         });
