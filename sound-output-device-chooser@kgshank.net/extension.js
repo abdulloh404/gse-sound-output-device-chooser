@@ -16,7 +16,7 @@
  ******************************************************************************/
 /* jshint moz:true */
 
-const { GObject } = imports.gi;
+const { Gio, GLib, GObject } = imports.gi;
 const ExtensionUtils = imports.misc.extensionUtils;
 const Me = ExtensionUtils.getCurrentExtension();
 const Base = Me.imports.base;
@@ -178,6 +178,143 @@ var SDCInstance = class SDCInstance {
             "notify::visible", () => { this._updateMenuVisibility(this._outputInstance, false) });
         this._signalManager.addSignal(getActor(this._volumeMenu._input.item),
             "notify::visible", () => { this._updateMenuVisibility(this._inputInstance, false) });
+
+        this._enabled = true;
+        this._audioServerWatch = null;
+        this._audioServerReconnectId = null;
+        this._audioServerReconnectDelay = 250;
+        this._startAudioServerWatch();
+    }
+
+    _syncAudioServerDefaults(facility) {
+        if (!this._enabled) {
+            return;
+        }
+        let control = this._outputInstance._getMixerControl();
+        if (facility != "source") {
+            this._outputInstance._queueActiveDeviceSync(control);
+        }
+        if (facility != "sink") {
+            this._inputInstance._queueActiveDeviceSync(control);
+        }
+    }
+
+    _startAudioServerWatch() {
+        if (!this._enabled || this._audioServerWatch) {
+            return;
+        }
+        let process;
+        try {
+            let launcher = new Gio.SubprocessLauncher({
+                flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE,
+            });
+            launcher.setenv("LC_ALL", "C", true);
+            process = launcher.spawnv(["pactl", "subscribe"]);
+        } catch (error) {
+            _d("Audio server subscription failed: " + error.message);
+            this._queueAudioServerReconnect();
+            return;
+        }
+        let watcher = {
+            process,
+            input: new Gio.DataInputStream({ base_stream: process.get_stdout_pipe() }),
+            cancellable: new Gio.Cancellable(),
+            ready: false,
+            exited: false,
+            snapshotId: null,
+        };
+        this._audioServerWatch = watcher;
+        // pactl ไม่มีข้อความพร้อมใช้งาน จึงใช้ client event จาก snapshot ยืนยัน แล้วหยุด timer
+        watcher.snapshotId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+            if (this._audioServerWatch !== watcher || watcher.ready) {
+                watcher.snapshotId = null;
+                return GLib.SOURCE_REMOVE;
+            }
+            this._syncAudioServerDefaults();
+            return GLib.SOURCE_CONTINUE;
+        });
+        process.wait_async(null, (source, result) => {
+            try {
+                source.wait_finish(result);
+            } catch (error) {
+                _d("Audio server subscription wait failed: " + error.message);
+            }
+            watcher.exited = true;
+            this._audioServerWatchEnded(watcher);
+        });
+        this._readAudioServerEvent(watcher);
+    }
+
+    _readAudioServerEvent(watcher) {
+        watcher.input.read_line_async(GLib.PRIORITY_DEFAULT, watcher.cancellable, (source, result) => {
+            let line = null;
+            try {
+                [line] = source.read_line_finish_utf8(result);
+            } catch (error) {
+                if (this._audioServerWatch === watcher) {
+                    _d("Audio server subscription read failed: " + error.message);
+                }
+            }
+            if (this._audioServerWatch !== watcher || line === null) {
+                this._audioServerWatchEnded(watcher);
+                source.close(null);
+                return;
+            }
+            if (!watcher.ready) {
+                watcher.ready = true;
+                this._audioServerReconnectDelay = 250;
+                if (watcher.snapshotId) {
+                    GLib.source_remove(watcher.snapshotId);
+                    watcher.snapshotId = null;
+                }
+                this._syncAudioServerDefaults();
+            }
+            // ไม่รับ client event จากคำสั่ง pactl ของเราเอง เพื่อไม่ให้เกิดวงจร sync ซ้ำ
+            // ข้าม sink/source change จาก volume/mute; การเปลี่ยน port มี GVC active-update รองรับ
+            let event = /^Event '(new|change|remove)' on (server|sink|source|card) #\d+$/.exec(line);
+            if (event && (event[1] != "change" || event[2] == "server" || event[2] == "card")) {
+                this._syncAudioServerDefaults(event[2]);
+            }
+            this._readAudioServerEvent(watcher);
+        });
+    }
+
+    _audioServerWatchEnded(watcher) {
+        if (this._audioServerWatch !== watcher) {
+            return;
+        }
+        this._stopAudioServerWatch();
+        this._queueAudioServerReconnect();
+    }
+
+    _queueAudioServerReconnect() {
+        if (!this._enabled || this._audioServerReconnectId) {
+            return;
+        }
+        // ใช้ timer เฉพาะตอน subscription หลุด และเพิ่มระยะรอเมื่อ server ยังไม่พร้อม
+        let delay = this._audioServerReconnectDelay;
+        this._audioServerReconnectDelay = Math.min(delay * 2, 5000);
+        this._audioServerReconnectId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
+            this._audioServerReconnectId = null;
+            this._startAudioServerWatch();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _stopAudioServerWatch() {
+        let watcher = this._audioServerWatch;
+        this._audioServerWatch = null;
+        if (!watcher) {
+            return;
+        }
+        if (watcher.snapshotId) {
+            GLib.source_remove(watcher.snapshotId);
+            watcher.snapshotId = null;
+        }
+        watcher.cancellable.cancel();
+        if (!watcher.exited) {
+            watcher.process.force_exit();
+        }
     }
 
     _addMenuItem(_volumeMenu, checkItem, menuItem) {
@@ -263,6 +400,12 @@ var SDCInstance = class SDCInstance {
     }
 
     disable() {
+        this._enabled = false;
+        if (this._audioServerReconnectId) {
+            GLib.source_remove(this._audioServerReconnectId);
+            this._audioServerReconnectId = null;
+        }
+        this._stopAudioServerWatch();
         //this._switchSubmenuMenu();
         this._revertVolMenuChanges();
         if (this._outputInstance) {
